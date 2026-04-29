@@ -1,0 +1,1957 @@
+## =====================================================
+## DDR1 scRNA-seq pipeline (ONE-PASS, reproducible)
+## Dataset: GSE140023 (10X folders: sham / uuo2 / uuo7 / ruuo)
+## Output naming: StepX_ prefix for ALL exported files
+## =====================================================
+
+## =========================
+## 0) Clean start + Reproducibility
+## =========================
+rm(list = ls())
+gc()
+set.seed(1234)
+
+## =========================
+## 1) Libraries
+## =========================
+suppressPackageStartupMessages({
+  library(Seurat)
+  library(dplyr)
+  library(stringr)
+  library(ggplot2)
+  library(scales)
+  library(tidyr)
+  library(patchwork)
+})
+
+## =========================
+## 2) Define paths
+## =========================
+PROJECT_DIR <- "C:/temp/DDR1 scRNA analysis"
+DATA_DIR    <- file.path(PROJECT_DIR, "GSE140023_extracted")
+FIG_DIR     <- file.path(PROJECT_DIR, "figure")
+if (!dir.exists(FIG_DIR)) dir.create(FIG_DIR, recursive = TRUE)
+
+cat("PROJECT_DIR =", PROJECT_DIR, "\n")
+cat("DATA_DIR    =", DATA_DIR, "\n")
+cat("FIG_DIR     =", FIG_DIR, "\n\n")
+
+stopifnot(dir.exists(PROJECT_DIR))
+stopifnot(dir.exists(DATA_DIR))
+
+## ---------- filename helpers (prefix StepX_) ----------
+out_file <- function(step, name, ext) {
+  file.path(FIG_DIR, sprintf("Step%d_%s.%s", step, name, ext))
+}
+out_rds <- function(step, name) {
+  file.path(PROJECT_DIR, sprintf("Step%d_%s.rds", step, name))
+}
+
+## =====================================================
+## Step 1 — Read 10X + Merge
+## =====================================================
+sample_dirs  <- sort(list.dirs(DATA_DIR, recursive = FALSE, full.names = TRUE))
+sample_names <- basename(sample_dirs)
+
+cat("Detected sample folders:\n")
+print(sample_names)
+
+check_10x <- function(p) {
+  f <- list.files(p, recursive = TRUE)
+  has_mtx  <- any(str_detect(f, "matrix\\.mtx(\\.gz)?$"))
+  has_bar  <- any(str_detect(f, "barcodes\\.tsv(\\.gz)?$"))
+  has_feat <- any(str_detect(f, "features\\.tsv(\\.gz)?$|genes\\.tsv(\\.gz)?$"))
+  c(has_mtx = has_mtx, has_barcodes = has_bar, has_features = has_feat)
+}
+ck <- t(sapply(sample_dirs, check_10x))
+rownames(ck) <- sample_names
+cat("\n10X file check (TRUE means found):\n")
+print(ck)
+if (any(!ck[, "has_mtx"] | !ck[, "has_barcodes"] | !ck[, "has_features"])) {
+  stop("Some sample folders do not look like standard 10X format. Please check DATA_DIR structure.")
+}
+
+read_one_sample <- function(sample_dir, sample_name) {
+  mtx_paths <- list.files(sample_dir, pattern = "matrix\\.mtx(\\.gz)?$",
+                          recursive = TRUE, full.names = TRUE)
+  if (length(mtx_paths) == 0) stop("No matrix.mtx found in: ", sample_dir)
+  mtx_dir <- dirname(mtx_paths[1])
+  cat("\nReading:", sample_name, "\n  from:", mtx_dir, "\n")
+
+  mat <- Read10X(data.dir = mtx_dir)
+
+  obj <- CreateSeuratObject(
+    counts = mat,
+    project = sample_name,
+    min.cells = 3,
+    min.features = 200
+  )
+  obj$condition <- sample_name
+  obj <- RenameCells(obj, add.cell.id = sample_name)
+  obj
+}
+
+obj_list <- vector("list", length(sample_dirs))
+names(obj_list) <- sample_names
+for (i in seq_along(sample_dirs)) {
+  obj_list[[i]] <- read_one_sample(sample_dirs[i], sample_names[i])
+}
+
+kidney <- Reduce(function(x, y) merge(x, y), obj_list)
+
+cat("\nMerged object:\n")
+print(kidney)
+cat("\nCells per condition:\n")
+print(table(kidney$condition))
+
+saveRDS(kidney, out_rds(1, "kidney_raw_merged"))
+cat("\n✅ Step1 saved:", out_rds(1, "kidney_raw_merged"), "\n")
+
+## =====================================================
+## Step 2 — QC + Normalize + PCA + Clustering + UMAP
+## =====================================================
+kidney$condition <- factor(kidney$condition, levels = c("sham", "uuo2", "uuo7", "ruuo"))
+
+DefaultAssay(kidney) <- "RNA"
+gene_names <- rownames(kidney[["RNA"]])
+mt_pat <- if (any(grepl("^mt-", gene_names))) "^mt-" else "^MT-"
+kidney[["percent.mt"]] <- PercentageFeatureSet(kidney, pattern = mt_pat)
+
+min_features <- 200
+max_features <- 7000
+max_mt       <- 50
+
+cat("\nUsing mitochondrial pattern:", mt_pat, "\n")
+cat("Filtering thresholds:\n",
+    "min_features =", min_features, "\n",
+    "max_features =", max_features, "\n",
+    "max_mt       =", max_mt, "\n\n")
+
+n_before <- ncol(kidney)
+kidney_filt <- subset(
+  kidney,
+  subset =
+    nFeature_RNA >= min_features &
+    nFeature_RNA <= max_features &
+    percent.mt <= max_mt
+)
+
+cat("Cells before:", n_before, "\n")
+cat("Cells after :", ncol(kidney_filt), "\n\n")
+
+p_qc <- VlnPlot(kidney_filt, features = c("nFeature_RNA","nCount_RNA","percent.mt"), ncol = 3, pt.size = 0) +
+  theme_classic(base_size = 12)
+ggsave(out_file(2, "QC_violin", "png"), p_qc, width = 10.5, height = 4, dpi = 300)
+
+kidney_filt <- NormalizeData(kidney_filt)
+kidney_filt <- FindVariableFeatures(kidney_filt, nfeatures = 3000)
+kidney_filt <- ScaleData(kidney_filt)
+kidney_filt <- RunPCA(kidney_filt, npcs = 50, seed.use = 1234)
+
+p_elbow <- ElbowPlot(kidney_filt, ndims = 50) + theme_classic(base_size = 12)
+ggsave(out_file(2, "PCA_elbow", "png"), p_elbow, width = 6, height = 4, dpi = 300)
+
+dims_use <- 1:30
+kidney_filt <- FindNeighbors(kidney_filt, dims = dims_use)
+kidney_filt <- FindClusters(kidney_filt, resolution = 0.6)
+kidney_filt <- RunUMAP(kidney_filt, dims = dims_use, seed.use = 1234)
+
+p_umap_cluster <- DimPlot(kidney_filt, group.by = "seurat_clusters",
+                          label = TRUE, repel = TRUE, pt.size = 0.2) +
+  theme_classic(base_size = 12)
+ggsave(out_file(2, "UMAP_by_cluster", "png"), p_umap_cluster, width = 7.5, height = 5.5, dpi = 300)
+
+p_umap_cond <- DimPlot(kidney_filt, group.by = "condition", pt.size = 0.2) +
+  theme_classic(base_size = 12)
+ggsave(out_file(2, "UMAP_by_condition", "png"), p_umap_cond, width = 7.5, height = 5.5, dpi = 300)
+
+saveRDS(kidney_filt, out_rds(2, "kidney_clustered"))
+cat("\n✅ Step2 saved:", out_rds(2, "kidney_clustered"), "\n")
+
+## =====================================================
+## Step 3 — Marker annotation + Fibroblast re-UMAP
+## (ONE-PASS: no readRDS; use kidney_filt directly)
+## =====================================================
+kidney_filt$condition <- factor(kidney_filt$condition, levels = c("sham","uuo2","uuo7","ruuo"))
+kidney_filt$cluster <- as.character(Idents(kidney_filt))
+
+markers_list <- list(
+  Tubular      = c("Lrp2","Aqp1","Slc34a1","Krt8","Krt18"),
+  Endothelial  = c("Kdr","Pecam1","Emcn","Klf2"),
+  Pericyte     = c("Rgs5","Pdgfrb","Cspg4","Des"),
+  Fibroblast   = c("Col1a1","Col1a2","Col3a1","Dcn","Pdgfra"),
+  Macrophage   = c("Adgre1","Lyz2","C1qa","C1qb","C1qc"),
+  DC           = c("Itgax","Flt3","Clec9a","Xcr1"),
+  T_cell       = c("Cd3d","Cd3e","Trac"),
+  B_cell       = c("Ms4a1","Cd79a","Cd79b","Cd19","Cd37")
+)
+
+genes_in <- rownames(kidney_filt[["RNA"]])
+markers_list <- lapply(markers_list, \(g) intersect(g, genes_in))
+
+kidney_filt <- AddModuleScore(kidney_filt, features = markers_list, name = "CTscore_", assay = "RNA", search = FALSE)
+score_cols <- paste0("CTscore_", seq_along(markers_list))
+names(score_cols) <- names(markers_list)
+
+md <- kidney_filt@meta.data
+md$cluster <- as.character(Idents(kidney_filt))
+score_mat <- md[, score_cols, drop = FALSE]
+celltype_auto <- names(markers_list)[max.col(score_mat)]
+md$celltype_auto <- factor(celltype_auto, levels = names(markers_list))
+
+cluster_vote <- md %>%
+  tibble::rownames_to_column("cell") %>%
+  count(cluster, celltype_auto, name = "n_cells") %>%
+  group_by(cluster) %>%
+  slice_max(n_cells, n = 1, with_ties = FALSE) %>%
+  ungroup()
+
+cluster_map <- setNames(as.character(cluster_vote$celltype_auto), cluster_vote$cluster)
+celltype_cluster_vec <- cluster_map[md$cluster]
+names(celltype_cluster_vec) <- rownames(md)
+
+kidney_filt$celltype_cluster <- factor(celltype_cluster_vec, levels = names(markers_list))
+
+p_celltype <- DimPlot(kidney_filt, group.by = "celltype_cluster", label = TRUE, repel = TRUE, pt.size = 0.2) +
+  theme_classic(base_size = 12) +
+  labs(title = "UMAP — Cell Type Annotation")
+ggsave(out_file(3, "UMAP_by_celltype", "png"), p_celltype, width = 8, height = 6, dpi = 300)
+
+saveRDS(kidney_filt, out_rds(3, "kidney_annotated"))
+
+fibro <- subset(kidney_filt, subset = celltype_cluster == "Fibroblast")
+cat("\nFibroblast cells:", ncol(fibro), "\n")
+
+DefaultAssay(fibro) <- "RNA"
+fibro <- NormalizeData(fibro)
+fibro <- FindVariableFeatures(fibro, nfeatures = 2000)
+fibro <- ScaleData(fibro)
+fibro <- RunPCA(fibro, npcs = 30, seed.use = 1234)
+
+dims_use_f <- 1:20
+fibro <- FindNeighbors(fibro, dims = dims_use_f)
+fibro <- FindClusters(fibro, resolution = 0.6)
+fibro <- RunUMAP(fibro, dims = dims_use_f, seed.use = 1234)
+
+p_fibro_cluster <- DimPlot(fibro, group.by = "seurat_clusters", label = TRUE, repel = TRUE, pt.size = 0.4) +
+  theme_classic(base_size = 12) + labs(title = "Fibroblast Re-UMAP — Clusters")
+ggsave(out_file(3, "Fibro_UMAP_cluster", "png"), p_fibro_cluster, width = 7, height = 5.5, dpi = 300)
+
+fibro$condition <- factor(fibro$condition, levels = c("sham","uuo2","uuo7","ruuo"))
+p_fibro_cond <- DimPlot(fibro, group.by = "condition", pt.size = 0.4) +
+  theme_classic(base_size = 12) + labs(title = "Fibroblast Re-UMAP — Condition")
+ggsave(out_file(3, "Fibro_UMAP_condition", "png"), p_fibro_cond, width = 7, height = 5.5, dpi = 300)
+
+saveRDS(fibro, out_rds(3, "fibroblast_reumap"))
+cat("\n✅ Step3 saved:", out_rds(3, "fibroblast_reumap"), "\n")
+
+## =====================================================
+## Step 4 — Fibroblast state classification (3-class)
+## =====================================================
+DefaultAssay(fibro) <- "RNA"
+
+genes_in <- rownames(fibro[["RNA"]])
+gene_map <- setNames(genes_in, toupper(genes_in))
+match_genes_ci <- function(g) {
+  g2 <- gene_map[toupper(g)]
+  g2 <- unname(g2[!is.na(g2)])
+  unique(g2)
+}
+
+quiescent_raw   <- c("Pdgfra","Dcn","Lum","Pi16")
+contractile_raw <- c("Acta2","Tagln","Cnn1","Myh11","Smtn")
+ecm_raw         <- c("Col1a1","Col1a2","Col3a1","Fn1","Postn","Mmp2","Mmp14","Timp1","Lox","Loxl2")
+
+quiescent_genes   <- match_genes_ci(quiescent_raw)
+contractile_genes <- match_genes_ci(contractile_raw)
+ecm_genes         <- match_genes_ci(ecm_raw)
+
+fibro <- AddModuleScore(fibro, features = list(quiescent_genes),   name = "QuiescentScore")
+fibro <- AddModuleScore(fibro, features = list(contractile_genes), name = "ContractileScore")
+fibro <- AddModuleScore(fibro, features = list(ecm_genes),         name = "ECMScore")
+
+qs <- "QuiescentScore1"
+cs <- "ContractileScore1"
+es <- "ECMScore1"
+
+delta_qc <- 0.10
+delta_my <- 0.10
+
+fibro$fib_state3 <- "Intermediate"
+fibro$fib_state3[fibro[[cs]][,1] > fibro[[qs]][,1] + delta_my] <- "Myofibroblast"
+fibro$fib_state3[fibro[[qs]][,1] > fibro[[cs]][,1] + delta_qc] <- "Quiescent"
+fibro$fib_state3 <- factor(fibro$fib_state3, levels = c("Quiescent","Intermediate","Myofibroblast"))
+
+cat("\nState counts:\n"); print(table(fibro$fib_state3))
+
+p_umap_state <- DimPlot(fibro, reduction = "umap", group.by = "fib_state3", pt.size = 0.4) +
+  theme_classic(base_size = 12) + labs(title = "Fibroblast States (3-class)")
+ggsave(out_file(4, "Fibro_UMAP_state3", "png"), p_umap_state, width = 7, height = 5.5, dpi = 300)
+
+dot_features <- unique(c(quiescent_genes, contractile_genes, match_genes_ci(c("Col1a1","Col3a1","Fn1","Postn","Mmp2","Lox"))))
+p_dot <- DotPlot(fibro, features = dot_features, group.by = "fib_state3") +
+  RotatedAxis() + theme_classic(base_size = 12) +
+  labs(title = "Marker dot plot (Quiescent / ECM / Contractile)")
+ggsave(out_file(4, "State3_DotPlot", "png"), p_dot, width = 10.5, height = 5.2, dpi = 300)
+
+p_vln_q <- VlnPlot(fibro, features = qs, group.by = "fib_state3", pt.size = 0) + theme_classic(base_size = 12) + labs(title = "QuiescentScore")
+p_vln_c <- VlnPlot(fibro, features = cs, group.by = "fib_state3", pt.size = 0) + theme_classic(base_size = 12) + labs(title = "ContractileScore")
+p_vln_e <- VlnPlot(fibro, features = es, group.by = "fib_state3", pt.size = 0) + theme_classic(base_size = 12) + labs(title = "ECMScore")
+
+p_scores <- p_vln_q | p_vln_c | p_vln_e
+ggsave(out_file(4, "Violin_scores", "png"), p_scores, width = 13.5, height = 4.2, dpi = 300)
+
+fig2c <- p_dot | (p_vln_q / p_vln_c)
+ggsave(out_file(4, "Figure2C_combined", "png"), fig2c, width = 13, height = 6, dpi = 300)
+
+
+## -----------------------------------------------------
+## Step 4B — Marker validation: fibroblast / pericyte / myofibroblast programs
+## Purpose:
+##   1) Add extended myofibroblast markers
+##   2) Generate 3-state marker dot plot and heatmap
+##   3) Compare fibroblast states with atlas pericytes as a positive control
+##      to evaluate possible pericyte contamination
+## -----------------------------------------------------
+
+DefaultAssay(fibro) <- "RNA"
+
+## case-insensitive gene matching, redefined safely
+genes_in <- rownames(fibro[["RNA"]])
+gene_map <- setNames(genes_in, toupper(genes_in))
+match_genes_ci <- function(g) {
+  g2 <- gene_map[toupper(g)]
+  g2 <- unname(g2[!is.na(g2)])
+  unique(g2)
+}
+
+renal_fibroblast_raw <- c(
+  "Col1a1", "Col3a1", "Dcn", "Lum", "Pdgfra"
+)
+
+renal_pericyte_raw <- c(
+  "Pdgfrb", "Cspg4", "Abcc9", "Kcnj8", "Rgs5", "Higd1b"
+)
+
+## extended myofibroblast / activated fibroblast markers
+myo_extended_raw <- c(
+  "Acta2", "Tagln", "Cnn1", "Smtn", "Myh9", "Myh10", "Myl9", "Mylk",
+  "Col1a1", "Col1a2", "Col3a1", "Fn1", "Postn", "Mmp2", "Timp1",
+  "Lox", "Loxl2"
+)
+
+renal_fibroblast_genes <- match_genes_ci(renal_fibroblast_raw)
+renal_pericyte_genes   <- match_genes_ci(renal_pericyte_raw)
+myo_extended_genes     <- match_genes_ci(myo_extended_raw)
+
+marker_validation_df <- dplyr::bind_rows(
+  data.frame(category = "Renal fibroblast", gene = renal_fibroblast_genes),
+  data.frame(category = "Renal pericyte / mural", gene = renal_pericyte_genes),
+  data.frame(category = "Myofibroblast extended", gene = myo_extended_genes)
+) %>%
+  dplyr::distinct(category, gene)
+
+write.csv(
+  marker_validation_df,
+  out_file(4, "State3_marker_validation_genes_used", "csv"),
+  row.names = FALSE
+)
+
+cat("\nStep4B marker validation genes detected:\n")
+print(marker_validation_df)
+
+## order genes by category, keeping duplicates only once in the displayed feature list
+marker_features <- marker_validation_df$gene[!duplicated(marker_validation_df$gene)]
+
+## 4B-1. DotPlot across current 3 fibroblast states
+p_state_marker_dot <- DotPlot(
+  fibro,
+  features = marker_features,
+  group.by = "fib_state3"
+) +
+  RotatedAxis() +
+  theme_classic(base_size = 12) +
+  labs(
+    title = "Fibroblast, pericyte, and extended myofibroblast markers",
+    subtitle = "Current 3-state fibroblast classification",
+    x = "Marker genes",
+    y = "Fibroblast state",
+    color = "Average expression",
+    size = "% expressing cells"
+  )
+
+ggsave(
+  out_file(4, "State3_Fibroblast_Pericyte_MyoExtended_DotPlot", "png"),
+  p_state_marker_dot,
+  width = 12,
+  height = 5.2,
+  dpi = 300
+)
+
+write.csv(
+  p_state_marker_dot$data,
+  out_file(4, "State3_Fibroblast_Pericyte_MyoExtended_DotPlot_data", "csv"),
+  row.names = FALSE
+)
+
+## 4B-2. 3-state heatmap based on mean normalized expression
+avg_marker <- AverageExpression(
+  fibro,
+  assays = "RNA",
+  features = marker_features,
+  group.by = "fib_state3",
+  slot = "data"
+)$RNA
+
+avg_marker <- as.matrix(avg_marker)
+
+## row-wise z-score for visualization
+z_marker <- t(scale(t(avg_marker)))
+z_marker[is.na(z_marker)] <- 0
+
+heat_df <- as.data.frame(z_marker) %>%
+  tibble::rownames_to_column("gene") %>%
+  tidyr::pivot_longer(
+    cols = -gene,
+    names_to = "fib_state3",
+    values_to = "scaled_avg_expr"
+  ) %>%
+  dplyr::left_join(marker_validation_df, by = "gene") %>%
+  dplyr::mutate(
+    fib_state3 = factor(fib_state3, levels = c("Quiescent", "Intermediate", "Myofibroblast")),
+    gene = factor(gene, levels = rev(marker_features)),
+    category = factor(category, levels = c("Renal fibroblast", "Renal pericyte / mural", "Myofibroblast extended"))
+  )
+
+write.csv(
+  heat_df,
+  out_file(4, "State3_marker_heatmap_scaled_average_data", "csv"),
+  row.names = FALSE
+)
+
+p_state_marker_heatmap <- ggplot(
+  heat_df,
+  aes(x = fib_state3, y = gene, fill = scaled_avg_expr)
+) +
+  geom_tile(color = "white", linewidth = 0.25) +
+  facet_grid(category ~ ., scales = "free_y", space = "free_y") +
+  scale_fill_gradient2(
+    low = "blue", mid = "white", high = "red",
+    midpoint = 0,
+    name = "Scaled\nmean expr."
+  ) +
+  theme_classic(base_size = 12) +
+  labs(
+    title = "3-state fibroblast marker heatmap",
+    subtitle = "Row-scaled average normalized expression",
+    x = "Fibroblast state",
+    y = "Marker genes"
+  ) +
+  theme(
+    strip.background = element_blank(),
+    strip.text.y = element_text(angle = 0, face = "bold"),
+    axis.text.x = element_text(angle = 30, hjust = 1)
+  )
+
+ggsave(
+  out_file(4, "State3_marker_heatmap_Fibroblast_Pericyte_MyoExtended", "png"),
+  p_state_marker_heatmap,
+  width = 7.5,
+  height = 9.5,
+  dpi = 300
+)
+
+## 4B-3. Pericyte positive-control comparison from full kidney atlas
+## This does NOT reclassify cells; it only compares the existing fibroblast states
+## against cells originally annotated as Pericyte in the whole-kidney atlas.
+fib_cells <- colnames(fibro)
+peri_cells <- colnames(kidney_filt)[kidney_filt$celltype_cluster == "Pericyte"]
+
+if (length(peri_cells) > 0) {
+
+  validation_cells <- unique(c(fib_cells, peri_cells))
+  validation_obj <- subset(kidney_filt, cells = validation_cells)
+  DefaultAssay(validation_obj) <- "RNA"
+
+  validation_obj$state_or_pericyte <- NA_character_
+
+  ## assign existing fibroblast state labels back to fibroblast cells
+  fib_state_lookup <- setNames(as.character(fibro$fib_state3), colnames(fibro))
+  validation_obj$state_or_pericyte[colnames(validation_obj) %in% fib_cells] <-
+    fib_state_lookup[colnames(validation_obj)[colnames(validation_obj) %in% fib_cells]]
+
+  ## assign pericyte positive-control cells
+  validation_obj$state_or_pericyte[colnames(validation_obj) %in% peri_cells] <- "Pericyte_positive_control"
+
+  validation_obj$state_or_pericyte <- factor(
+    validation_obj$state_or_pericyte,
+    levels = c("Quiescent", "Intermediate", "Myofibroblast", "Pericyte_positive_control")
+  )
+
+  validation_obj <- subset(validation_obj, subset = !is.na(state_or_pericyte))
+
+  ## Need a gene map for validation_obj, because it comes from kidney_filt
+  genes_in_val <- rownames(validation_obj[["RNA"]])
+  gene_map_val <- setNames(genes_in_val, toupper(genes_in_val))
+  match_genes_ci_val <- function(g) {
+    g2 <- gene_map_val[toupper(g)]
+    g2 <- unname(g2[!is.na(g2)])
+    unique(g2)
+  }
+
+  peri_val_genes <- match_genes_ci_val(renal_pericyte_raw)
+  fib_val_genes  <- match_genes_ci_val(renal_fibroblast_raw)
+  myo_val_genes  <- match_genes_ci_val(myo_extended_raw)
+  validation_features <- unique(c(fib_val_genes, peri_val_genes, myo_val_genes))
+
+  p_peri_validation_dot <- DotPlot(
+    validation_obj,
+    features = validation_features,
+    group.by = "state_or_pericyte"
+  ) +
+    RotatedAxis() +
+    theme_classic(base_size = 12) +
+    labs(
+      title = "Pericyte marker validation using atlas pericytes as positive control",
+      subtitle = "Current fibroblast states compared with original whole-kidney pericyte annotation",
+      x = "Marker genes",
+      y = NULL,
+      color = "Average expression",
+      size = "% expressing cells"
+    )
+
+  ggsave(
+    out_file(4, "Pericyte_positive_control_DotPlot", "png"),
+    p_peri_validation_dot,
+    width = 13,
+    height = 5.8,
+    dpi = 300
+  )
+
+  write.csv(
+    p_peri_validation_dot$data,
+    out_file(4, "Pericyte_positive_control_DotPlot_data", "csv"),
+    row.names = FALSE
+  )
+
+  ## PericyteScore comparison
+  validation_obj <- AddModuleScore(
+    validation_obj,
+    features = list(peri_val_genes),
+    name = "PericyteScore",
+    assay = "RNA",
+    search = FALSE
+  )
+
+  p_peri_score <- VlnPlot(
+    validation_obj,
+    features = "PericyteScore1",
+    group.by = "state_or_pericyte",
+    pt.size = 0
+  ) +
+    theme_classic(base_size = 12) +
+    labs(
+      title = "Pericyte module score validation",
+      subtitle = "Positive-control pericytes should show the highest score",
+      x = NULL,
+      y = "PericyteScore"
+    ) +
+    theme(axis.text.x = element_text(angle = 30, hjust = 1))
+
+  ggsave(
+    out_file(4, "PericyteScore_validation_violin", "png"),
+    p_peri_score,
+    width = 8.5,
+    height = 5,
+    dpi = 300
+  )
+
+  peri_score_summary <- validation_obj@meta.data %>%
+    dplyr::group_by(state_or_pericyte) %>%
+    dplyr::summarise(
+      n_cells = dplyr::n(),
+      PericyteScore_mean = mean(PericyteScore1, na.rm = TRUE),
+      PericyteScore_sd = sd(PericyteScore1, na.rm = TRUE),
+      PericyteScore_median = median(PericyteScore1, na.rm = TRUE),
+      .groups = "drop"
+    )
+
+  write.csv(
+    peri_score_summary,
+    out_file(4, "PericyteScore_validation_summary", "csv"),
+    row.names = FALSE
+  )
+
+  ## Optional Excel summary if openxlsx is available
+  if (requireNamespace("openxlsx", quietly = TRUE)) {
+    wb <- openxlsx::createWorkbook()
+    openxlsx::addWorksheet(wb, "marker_genes")
+    openxlsx::writeData(wb, "marker_genes", marker_validation_df)
+    openxlsx::addWorksheet(wb, "heatmap_scaled_data")
+    openxlsx::writeData(wb, "heatmap_scaled_data", heat_df)
+    openxlsx::addWorksheet(wb, "pericyte_score_summary")
+    openxlsx::writeData(wb, "pericyte_score_summary", peri_score_summary)
+    openxlsx::addWorksheet(wb, "pericyte_dotplot_data")
+    openxlsx::writeData(wb, "pericyte_dotplot_data", p_peri_validation_dot$data)
+    openxlsx::saveWorkbook(wb, out_file(4, "Pericyte_validation_and_marker_heatmap", "xlsx"), overwrite = TRUE)
+  }
+
+  cat("\n✅ Step4B completed — myo_extended markers, 3-state heatmap, and pericyte validation saved\n")
+
+} else {
+  warning("No Pericyte cells found in kidney_filt$celltype_cluster. Skipping positive-control pericyte validation.")
+}
+
+saveRDS(fibro, out_rds(4, "fibroblast_state3"))
+cat("\n✅ Step4 saved:", out_rds(4, "fibroblast_state3"), "\n")
+
+## =====================================================
+## Step 5 — Composition + DDR1 + Bar stats (FINAL CLEAN)
+## =====================================================
+
+suppressPackageStartupMessages({
+  library(dplyr)
+  library(ggplot2)
+  library(tidyr)
+  library(scales)
+  library(openxlsx)
+})
+
+DefaultAssay(fibro) <- "RNA"
+fibro$condition  <- factor(fibro$condition,  levels = c("sham","uuo2","uuo7","ruuo"))
+fibro$fib_state3 <- factor(fibro$fib_state3, levels = c("Quiescent","Intermediate","Myofibroblast"))
+
+gene_ddr1 <- if ("Ddr1" %in% rownames(fibro)) "Ddr1" else if ("DDR1" %in% rownames(fibro)) "DDR1" else NA
+if (is.na(gene_ddr1)) stop("Cannot find Ddr1/DDR1 in rownames(fibro).")
+
+## -------------------------------------------------
+## Composition
+## -------------------------------------------------
+
+comp_table <- fibro@meta.data %>%
+  group_by(condition, fib_state3) %>%
+  summarise(n = n(), .groups = "drop") %>%
+  group_by(condition) %>%
+  mutate(prop = n / sum(n))
+
+write.csv(comp_table, out_file(5, "State_Composition_table", "csv"), row.names = FALSE)
+
+p_comp_fill <- ggplot(comp_table, aes(x = condition, y = prop, fill = fib_state3)) +
+  geom_col(width = 0.85) +
+  geom_text(aes(label = n), position = position_stack(vjust = 0.5), size = 3) +
+  scale_y_continuous(labels = percent_format(accuracy = 1)) +
+  theme_classic(base_size = 12) +
+  labs(title = "Fibroblast state composition (3-class)",
+       x = "Condition", y = "Proportion")
+
+ggsave(out_file(5, "State_Composition", "png"),
+       p_comp_fill, width = 6.6, height = 4.8, dpi = 300)
+
+## -------------------------------------------------
+## Extract RAW UMI counts
+## -------------------------------------------------
+
+get_counts_vec <- function(obj, feature, assay = "RNA") {
+
+  if (exists("Layers", mode = "function") &&
+      exists("JoinLayers", mode = "function")) {
+
+    assy <- obj[[assay]]
+    lay  <- tryCatch(Layers(assy), error = function(e) NULL)
+
+    if (!is.null(lay) && length(lay) > 1) {
+      obj <- JoinLayers(obj, assay = assay)
+    }
+  }
+
+  if (exists("LayerData", mode = "function")) {
+    x <- LayerData(obj, assay = assay, layer = "counts")
+  } else {
+    x <- GetAssayData(obj, assay = assay, slot = "counts")
+  }
+
+  as.numeric(x[feature, ])
+}
+
+ddr1_raw <- get_counts_vec(fibro, gene_ddr1)
+
+df_bar <- data.frame(
+  condition  = fibro$condition,
+  fib_state3 = fibro$fib_state3,
+  Ddr1_raw   = ddr1_raw
+)
+
+## -------------------------------------------------
+## Mean ± SEM
+## -------------------------------------------------
+
+sum_bar <- df_bar %>%
+  group_by(condition, fib_state3) %>%
+  summarise(
+    n    = n(),
+    mean = mean(Ddr1_raw, na.rm = TRUE),
+    sd   = sd(Ddr1_raw, na.rm = TRUE),
+    sem  = sd / sqrt(n),
+    .groups = "drop"
+  )
+
+write.csv(sum_bar,
+          out_file(5, "DDR1_bar_meanSEM_rawUMI_table", "csv"),
+          row.names = FALSE)
+
+## -------------------------------------------------
+## Bar plot
+## -------------------------------------------------
+
+p_bar_ddr1 <- ggplot(sum_bar,
+                     aes(x = condition, y = mean, fill = fib_state3)) +
+  geom_col(position = position_dodge(0.85),
+           width = 0.75,
+           color = "black") +
+  geom_errorbar(aes(ymin = pmax(0, mean - sem),
+                    ymax = mean + sem),
+                position = position_dodge(0.85),
+                width = 0.2) +
+  theme_classic(base_size = 14) +
+  labs(title = "DDR1 expression across fibroblast states and conditions",
+       x = "Condition",
+       y = "Mean DDR1 raw UMI counts",
+       fill = "Fibroblast state")
+
+ggsave(out_file(5, "DDR1_bar_mean_rawUMI", "png"),
+       p_bar_ddr1, width = 8.2, height = 5.2, dpi = 300)
+
+## -------------------------------------------------
+## Wilcoxon vs sham (BH adjusted)
+## -------------------------------------------------
+
+get_p_from_mat <- function(mat, g1, g2) {
+  p1 <- tryCatch(mat[g2, g1], error = function(e) NA_real_)
+  p2 <- tryCatch(mat[g1, g2], error = function(e) NA_real_)
+  if (!is.na(p1)) return(as.numeric(p1))
+  if (!is.na(p2)) return(as.numeric(p2))
+  NA_real_
+}
+
+pw_bar_within <- bind_rows(lapply(levels(df_bar$fib_state3), function(s) {
+
+  sub <- df_bar %>% filter(fib_state3 == s)
+  if (nrow(sub) == 0) return(NULL)
+
+  pw <- pairwise.wilcox.test(sub$Ddr1_raw,
+                             sub$condition,
+                             p.adjust.method = "BH")
+
+  others <- setdiff(levels(sub$condition), "sham")
+
+  lapply(others, function(cond2) {
+    data.frame(
+      fib_state3 = s,
+      group1 = "sham",
+      group2 = cond2,
+      p_adj  = get_p_from_mat(pw$p.value, "sham", cond2)
+    )
+  }) %>% bind_rows()
+
+}))
+
+write.csv(pw_bar_within,
+          out_file(5, "DDR1_bar_Wilcoxon_vsSham_BH", "csv"),
+          row.names = FALSE)
+
+p_ddr1_violin_dot <- ggplot(
+  df_bar,
+  aes(x = condition, y = Ddr1_raw, fill = fib_state3)
+) +
+  geom_violin(
+    position = position_dodge(width = 0.85),
+    trim = TRUE,
+    alpha = 0.6,
+    linewidth = 0.3,
+    color = "black"
+  ) +
+  geom_jitter(
+    aes(group = fib_state3),
+    position = position_jitterdodge(
+      jitter.width = 0.12,
+      dodge.width = 0.85
+    ),
+    size = 0.6,
+    alpha = 0.25,
+    color = "black"
+  ) +
+  labs(
+    title = "DDR1 expression across fibroblast states and conditions",
+    x = "Condition",
+    y = "DDR1 raw UMI counts",
+    fill = "Fibroblast state"
+  ) +
+  theme_classic(base_size = 14)
+
+ggsave(
+  out_file(5, "DDR1_violin_dot_rawUMI", "png"),
+  p_ddr1_violin_dot,
+  width = 8.2,
+  height = 5.2,
+  dpi = 300
+)
+
+## -------------------------------------------------
+## Export Excel
+## -------------------------------------------------
+
+xlsx_path <- out_file(5, "DDR1_bar_mean_rawUMI_stats", "xlsx")
+
+wb <- createWorkbook()
+addWorksheet(wb, "mean_SEM")
+writeData(wb, "mean_SEM", sum_bar)
+addWorksheet(wb, "wilcox_vs_sham_BH")
+writeData(wb, "wilcox_vs_sham_BH", pw_bar_within)
+
+saveWorkbook(wb, xlsx_path, overwrite = TRUE)
+
+cat("Step5 completed. Excel saved at:\n", xlsx_path, "\n")
+
+## =====================================================
+## Step 6 — DotPlot for ECM remodeling programs
+##        Compare sham / uuo2 / uuo7 across
+##        Quiescent / Intermediate / Myofibroblast
+## =====================================================
+
+suppressPackageStartupMessages({
+  library(Seurat)
+  library(dplyr)
+  library(ggplot2)
+})
+
+DefaultAssay(fibro) <- "RNA"
+
+## -------------------------------------------------
+## 1. Case-insensitive gene matching
+## -------------------------------------------------
+
+genes_in <- rownames(fibro)
+gene_map <- setNames(genes_in, toupper(genes_in))
+
+match_genes_ci <- function(g) {
+  g2 <- gene_map[toupper(g)]
+  g2 <- unname(g2[!is.na(g2)])
+  unique(g2)
+}
+
+## -------------------------------------------------
+## 2. Define gene lists
+## -------------------------------------------------
+
+## A. podosome / ECM degradation
+genes_deg_full_raw <- c(
+  "CTTN","WASL","SH3PXD2A","SH3PXD2B",
+  "SRC","PTK2","PXN","VCL","TLN1",
+  "ACTB","ACTR2","ACTR3","ARPC2","ARPC3","CFL1",
+  "CDC42","RAC1","RHOA",
+  "MMP2","MMP9","MMP14","MMP13",
+  "ADAM12","ADAMTS2","ADAMTS4",
+  "ITGB1","ITGB3","ITGAV",
+  "DDR1","DDR2"
+)
+
+genes_deg_core_raw <- c(
+  "CTTN","SH3PXD2A","WASL",
+  "SRC","PTK2","PXN",
+  "MMP14","MMP2","MMP9",
+  "ITGB1","ITGAV",
+  "DDR1"
+)
+
+## B. cell contraction / collagen aggregation
+genes_con_full_raw <- c(
+  "ACTA2","MYH9","MYH10","MYLK","MYL9","MYL12A",
+  "RHOA","ROCK1","ROCK2","LIMK1","LIMK2","CFL1",
+  "TAGLN","CNN1","SMTN",
+  "PTK2","PXN","VCL","TLN1","ILK","PARVA","PARVB",
+  "ITGA1","ITGA2","ITGA5","ITGB1","ITGB3","ITGAV",
+  "COL1A1","COL1A2","COL3A1","FN1","POSTN",
+  "LOX","LOXL1","LOXL2","PLOD1","PLOD2",
+  "YAP1","WWTR1","SRF"
+)
+
+genes_con_core_raw <- c(
+  "ACTA2","MYH9","MYL9","MYLK",
+  "ROCK1","RHOA",
+  "TAGLN",
+  "ITGA5","ITGB1",
+  "COL1A1","COL1A2",
+  "LOX","LOXL2",
+  "FN1","POSTN"
+)
+
+genes_deg_full <- match_genes_ci(genes_deg_full_raw)
+genes_deg_core <- match_genes_ci(genes_deg_core_raw)
+genes_con_full <- match_genes_ci(genes_con_full_raw)
+genes_con_core <- match_genes_ci(genes_con_core_raw)
+
+cat("Detected genes:\n")
+cat("  Degradation full :", length(genes_deg_full), "\n")
+cat("  Degradation core :", length(genes_deg_core), "\n")
+cat("  Contraction full :", length(genes_con_full), "\n")
+cat("  Contraction core :", length(genes_con_core), "\n\n")
+
+cat("Degradation core genes:\n"); print(genes_deg_core)
+cat("Contraction core genes:\n"); print(genes_con_core)
+
+## -------------------------------------------------
+## 3. Subset sham / uuo2 / uuo7 and 3 fibroblast states
+## -------------------------------------------------
+
+fib_3x3 <- subset(
+  fibro,
+  subset = condition %in% c("sham", "uuo2", "uuo7") &
+    fib_state3 %in% c("Quiescent", "Intermediate", "Myofibroblast")
+)
+
+fib_3x3$condition  <- droplevels(fib_3x3$condition)
+fib_3x3$fib_state3 <- droplevels(fib_3x3$fib_state3)
+
+fib_3x3$group_3x3 <- paste(fib_3x3$condition, fib_3x3$fib_state3, sep = "_")
+fib_3x3$group_3x3 <- factor(
+  fib_3x3$group_3x3,
+  levels = c(
+    "sham_Quiescent",
+    "sham_Intermediate",
+    "sham_Myofibroblast",
+    "uuo2_Quiescent",
+    "uuo2_Intermediate",
+    "uuo2_Myofibroblast",
+    "uuo7_Quiescent",
+    "uuo7_Intermediate",
+    "uuo7_Myofibroblast"
+  )
+)
+
+cat("Cells in fib_3x3:", ncol(fib_3x3), "\n")
+print(table(fib_3x3$group_3x3))
+
+Idents(fib_3x3) <- fib_3x3$group_3x3
+
+## -------------------------------------------------
+## 4. Helper: export DotPlot data
+## -------------------------------------------------
+
+export_dotplot_data <- function(obj, features, group_col, file_stub) {
+  dp <- DotPlot(obj, features = features, group.by = group_col)
+  df <- dp$data
+  write.csv(
+    df,
+    out_file(6, paste0(file_stub, "_dotplot_data"), "csv"),
+    row.names = FALSE
+  )
+  return(dp)
+}
+
+## -------------------------------------------------
+## 5. Core dot plots
+## -------------------------------------------------
+
+## 5A. Core podosome / ECM degradation
+dp_deg_core <- export_dotplot_data(
+  obj = fib_3x3,
+  features = genes_deg_core,
+  group_col = "group_3x3",
+  file_stub = "Podosome_ECMdegradation_core_3x3"
+)
+
+p_deg_core <- dp_deg_core +
+  RotatedAxis() +
+  theme_classic(base_size = 12) +
+  labs(
+    title = "Core podosome / ECM degradation genes",
+    subtitle = "Fibroblast states across sham, uuo2, and uuo7",
+    x = NULL,
+    y = NULL,
+    color = "Average expression",
+    size = "% expressing cells"
+  ) +
+  theme(
+    axis.text.x = element_text(angle = 45, hjust = 1, vjust = 1),
+    plot.title = element_text(face = "bold"),
+    plot.subtitle = element_text(face = "bold")
+  )
+
+ggsave(
+  out_file(6, "Podosome_ECMdegradation_core_dotplot_3x3", "png"),
+  p_deg_core,
+  width = 11,
+  height = 6,
+  dpi = 300
+)
+
+## 5B. Core contraction / collagen aggregation
+dp_con_core <- export_dotplot_data(
+  obj = fib_3x3,
+  features = genes_con_core,
+  group_col = "group_3x3",
+  file_stub = "CellContraction_CollagenAggregation_core_3x3"
+)
+
+p_con_core <- dp_con_core +
+  RotatedAxis() +
+  theme_classic(base_size = 12) +
+  labs(
+    title = "Core cell contraction / collagen aggregation genes",
+    subtitle = "Fibroblast states across sham, uuo2, and uuo7",
+    x = NULL,
+    y = NULL,
+    color = "Average expression",
+    size = "% expressing cells"
+  ) +
+  theme(
+    axis.text.x = element_text(angle = 45, hjust = 1, vjust = 1),
+    plot.title = element_text(face = "bold"),
+    plot.subtitle = element_text(face = "bold")
+  )
+
+ggsave(
+  out_file(6, "CellContraction_CollagenAggregation_core_dotplot_3x3", "png"),
+  p_con_core,
+  width = 12,
+  height = 6,
+  dpi = 300
+)
+
+## -------------------------------------------------
+## 6. Full dot plots
+## -------------------------------------------------
+
+## 6A. Full podosome / ECM degradation
+dp_deg_full <- export_dotplot_data(
+  obj = fib_3x3,
+  features = genes_deg_full,
+  group_col = "group_3x3",
+  file_stub = "Podosome_ECMdegradation_full_3x3"
+)
+
+p_deg_full <- dp_deg_full +
+  RotatedAxis() +
+  theme_classic(base_size = 12) +
+  labs(
+    title = "Podosome / ECM degradation genes",
+    subtitle = "Fibroblast states across sham, uuo2, and uuo7",
+    x = NULL,
+    y = NULL,
+    color = "Average expression",
+    size = "% expressing cells"
+  ) +
+  theme(
+    axis.text.x = element_text(angle = 45, hjust = 1, vjust = 1),
+    plot.title = element_text(face = "bold"),
+    plot.subtitle = element_text(face = "bold")
+  )
+
+ggsave(
+  out_file(6, "Podosome_ECMdegradation_full_dotplot_3x3", "png"),
+  p_deg_full,
+  width = 16,
+  height = 6.5,
+  dpi = 300
+)
+
+## 6B. Full contraction / collagen aggregation
+dp_con_full <- export_dotplot_data(
+  obj = fib_3x3,
+  features = genes_con_full,
+  group_col = "group_3x3",
+  file_stub = "CellContraction_CollagenAggregation_full_3x3"
+)
+
+p_con_full <- dp_con_full +
+  RotatedAxis() +
+  theme_classic(base_size = 12) +
+  labs(
+    title = "Cell contraction / collagen aggregation genes",
+    subtitle = "Fibroblast states across sham, uuo2, and uuo7",
+    x = NULL,
+    y = NULL,
+    color = "Average expression",
+    size = "% expressing cells"
+  ) +
+  theme(
+    axis.text.x = element_text(angle = 45, hjust = 1, vjust = 1),
+    plot.title = element_text(face = "bold"),
+    plot.subtitle = element_text(face = "bold")
+  )
+
+ggsave(
+  out_file(6, "CellContraction_CollagenAggregation_full_dotplot_3x3", "png"),
+  p_con_full,
+  width = 17,
+  height = 6.8,
+  dpi = 300
+)
+
+cat("\n✅ Step6 completed — 3 conditions × 3 states dot plots saved\n")
+
+## -------------------------------------------------
+## 7. TGF-beta signaling dot plots
+## -------------------------------------------------
+
+genes_tgfb_core_raw <- c(
+  "TGFB1","TGFBR1","TGFBR2",
+  "SMAD2","SMAD3","SMAD4","SMAD7",
+  "SERPINE1","CTGF",
+  "ACTA2","TAGLN",
+  "COL1A1","COL1A2","FN1",
+  "POSTN"
+)
+
+genes_tgfb_full_raw <- c(
+  "TGFB1","TGFB2","TGFB3",
+  "TGFBR1","TGFBR2","TGFBR3",
+  "SMAD2","SMAD3","SMAD4","SMAD7",
+  "LTBP1","LTBP2","LTBP3",
+  "THBS1",
+  "SERPINE1","CTGF","JUNB",
+  "ID1","ID3",
+  "COL1A1","COL1A2","COL3A1",
+  "FN1","POSTN",
+  "ACTA2","TAGLN",
+  "MMP2","TIMP1","ITGB1"
+)
+
+genes_tgfb_core <- match_genes_ci(genes_tgfb_core_raw)
+genes_tgfb_full <- match_genes_ci(genes_tgfb_full_raw)
+
+cat("TGF-beta genes detected:\n")
+cat("  TGFb core :", length(genes_tgfb_core), "\n")
+cat("  TGFb full :", length(genes_tgfb_full), "\n\n")
+
+cat("TGFb core genes:\n"); print(genes_tgfb_core)
+cat("TGFb full genes:\n"); print(genes_tgfb_full)
+
+## 7A. Core TGF-beta signaling
+dp_tgfb_core <- export_dotplot_data(
+  obj = fib_3x3,
+  features = genes_tgfb_core,
+  group_col = "group_3x3",
+  file_stub = "TGFb_signaling_core_3x3"
+)
+
+p_tgfb_core <- dp_tgfb_core +
+  RotatedAxis() +
+  theme_classic(base_size = 12) +
+  labs(
+    title = "Core TGF-beta signaling genes",
+    subtitle = "Fibroblast states across sham, uuo2, and uuo7",
+    x = NULL,
+    y = NULL,
+    color = "Average expression",
+    size = "% expressing cells"
+  ) +
+  theme(
+    axis.text.x = element_text(angle = 45, hjust = 1, vjust = 1),
+    plot.title = element_text(face = "bold"),
+    plot.subtitle = element_text(face = "bold")
+  )
+
+ggsave(
+  out_file(6, "TGFb_signaling_core_dotplot_3x3", "png"),
+  p_tgfb_core,
+  width = 12,
+  height = 6,
+  dpi = 300
+)
+
+## 7B. Full TGF-beta signaling
+dp_tgfb_full <- export_dotplot_data(
+  obj = fib_3x3,
+  features = genes_tgfb_full,
+  group_col = "group_3x3",
+  file_stub = "TGFb_signaling_full_3x3"
+)
+
+p_tgfb_full <- dp_tgfb_full +
+  RotatedAxis() +
+  theme_classic(base_size = 12) +
+  labs(
+    title = "TGF-beta signaling genes",
+    subtitle = "Fibroblast states across sham, uuo2, and uuo7",
+    x = NULL,
+    y = NULL,
+    color = "Average expression",
+    size = "% expressing cells"
+  ) +
+  theme(
+    axis.text.x = element_text(angle = 45, hjust = 1, vjust = 1),
+    plot.title = element_text(face = "bold"),
+    plot.subtitle = element_text(face = "bold")
+  )
+
+ggsave(
+  out_file(6, "TGFb_signaling_full_dotplot_3x3", "png"),
+  p_tgfb_full,
+  width = 15,
+  height = 6.5,
+  dpi = 300
+)
+
+cat("\n✅ Step6 updated — TGF-beta signaling dot plots saved\n")
+
+## =====================================================
+## Step 7 — Module scores
+##        podosome_score / contraction_score / TGFb_response_score
+## =====================================================
+
+suppressPackageStartupMessages({
+  library(Seurat)
+  library(dplyr)
+  library(ggplot2)
+  library(tidyr)
+  library(patchwork)
+  library(openxlsx)
+})
+
+DefaultAssay(fibro) <- "RNA"
+
+## -------------------------------------------------
+## 1. Case-insensitive gene matching
+## -------------------------------------------------
+
+genes_in <- rownames(fibro)
+gene_map <- setNames(genes_in, toupper(genes_in))
+
+match_genes_ci <- function(g) {
+  g2 <- gene_map[toupper(g)]
+  g2 <- unname(g2[!is.na(g2)])
+  unique(g2)
+}
+
+## -------------------------------------------------
+## 2. Define gene sets
+## -------------------------------------------------
+
+## A. Podosome / ECM degradation score
+genes_podosome_raw <- c(
+  "CTTN","SH3PXD2A","SH3PXD2B","WASL",
+  "SRC","PTK2","PXN",
+  "MMP14","MMP2",
+  "ITGB1","ITGAV",
+  "DDR1"
+)
+
+## B. Contraction / collagen aggregation score
+genes_contraction_raw <- c(
+  "ACTA2","MYH9","MYL9","MYLK",
+  "ROCK1","RHOA",
+  "TAGLN",
+  "ITGA5","ITGB1",
+  "COL1A1","COL1A2",
+  "LOX","LOXL2",
+  "FN1","POSTN"
+)
+
+## C. TGF-beta response score
+genes_tgfb_raw <- c(
+  "TGFBR1","TGFBR2",
+  "SMAD2","SMAD3","SMAD4","SMAD7",
+  "SERPINE1","CTGF",
+  "COL1A1","COL1A2","FN1","POSTN",
+  "ACTA2","TAGLN"
+)
+
+genes_podosome   <- match_genes_ci(genes_podosome_raw)
+genes_contraction <- match_genes_ci(genes_contraction_raw)
+genes_tgfb       <- match_genes_ci(genes_tgfb_raw)
+
+cat("Detected score genes:\n")
+cat("  Podosome   :", length(genes_podosome), "\n")
+cat("  Contraction:", length(genes_contraction), "\n")
+cat("  TGFb       :", length(genes_tgfb), "\n\n")
+
+cat("Podosome genes:\n"); print(genes_podosome)
+cat("Contraction genes:\n"); print(genes_contraction)
+cat("TGFb response genes:\n"); print(genes_tgfb)
+
+## -------------------------------------------------
+## 3. AddModuleScore
+## -------------------------------------------------
+
+fibro <- AddModuleScore(
+  fibro,
+  features = list(genes_podosome),
+  name = "PodosomeScore",
+  assay = "RNA",
+  search = FALSE
+)
+
+fibro <- AddModuleScore(
+  fibro,
+  features = list(genes_contraction),
+  name = "ContractionScore",
+  assay = "RNA",
+  search = FALSE
+)
+
+fibro <- AddModuleScore(
+  fibro,
+  features = list(genes_tgfb),
+  name = "TGFbResponseScore",
+  assay = "RNA",
+  search = FALSE
+)
+
+## rename to clean column names
+fibro$podosome_score       <- fibro$PodosomeScore1
+fibro$contraction_score    <- fibro$ContractionScore1
+fibro$TGFb_response_score  <- fibro$TGFbResponseScore1
+
+## save updated object
+saveRDS(fibro, out_rds(7, "fibroblast_with_module_scores"))
+
+## -------------------------------------------------
+## 4. UMAP feature plots
+## -------------------------------------------------
+
+p_umap_podo <- FeaturePlot(
+  fibro,
+  features = "podosome_score",
+  reduction = "umap",
+  pt.size = 0.4
+) + theme_classic(base_size = 12) + labs(title = "Podosome score")
+
+p_umap_con <- FeaturePlot(
+  fibro,
+  features = "contraction_score",
+  reduction = "umap",
+  pt.size = 0.4
+) + theme_classic(base_size = 12) + labs(title = "Contraction score")
+
+p_umap_tgfb <- FeaturePlot(
+  fibro,
+  features = "TGFb_response_score",
+  reduction = "umap",
+  pt.size = 0.4
+) + theme_classic(base_size = 12) + labs(title = "TGF-beta response score")
+
+ggsave(
+  out_file(7, "UMAP_module_scores", "png"),
+  p_umap_podo | p_umap_con | p_umap_tgfb,
+  width = 15,
+  height = 4.8,
+  dpi = 300
+)
+
+## -------------------------------------------------
+## 5. 3x3 grouping for violin plots
+## -------------------------------------------------
+
+fibro$condition  <- factor(fibro$condition, levels = c("sham","uuo2","uuo7","ruuo"))
+fibro$fib_state3 <- factor(fibro$fib_state3, levels = c("Quiescent","Intermediate","Myofibroblast"))
+
+fib_3x3 <- subset(
+  fibro,
+  subset = condition %in% c("sham","uuo2","uuo7") &
+    fib_state3 %in% c("Quiescent","Intermediate","Myofibroblast")
+)
+
+fib_3x3$group_3x3 <- paste(fib_3x3$condition, fib_3x3$fib_state3, sep = "_")
+fib_3x3$group_3x3 <- factor(
+  fib_3x3$group_3x3,
+  levels = c(
+    "sham_Quiescent",
+    "sham_Intermediate",
+    "sham_Myofibroblast",
+    "uuo2_Quiescent",
+    "uuo2_Intermediate",
+    "uuo2_Myofibroblast",
+    "uuo7_Quiescent",
+    "uuo7_Intermediate",
+    "uuo7_Myofibroblast"
+  )
+)
+
+## -------------------------------------------------
+## 6. Violin plots
+## -------------------------------------------------
+
+p_vln_podo <- VlnPlot(
+  fib_3x3,
+  features = "podosome_score",
+  group.by = "group_3x3",
+  pt.size = 0
+) +
+  theme_classic(base_size = 12) +
+  labs(title = "Podosome score", x = NULL, y = "Module score") +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+
+p_vln_con <- VlnPlot(
+  fib_3x3,
+  features = "contraction_score",
+  group.by = "group_3x3",
+  pt.size = 0
+) +
+  theme_classic(base_size = 12) +
+  labs(title = "Contraction score", x = NULL, y = "Module score") +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+
+p_vln_tgfb <- VlnPlot(
+  fib_3x3,
+  features = "TGFb_response_score",
+  group.by = "group_3x3",
+  pt.size = 0
+) +
+  theme_classic(base_size = 12) +
+  labs(title = "TGF-beta response score", x = NULL, y = "Module score") +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+
+ggsave(
+  out_file(7, "Violin_module_scores_3x3", "png"),
+  p_vln_podo / p_vln_con / p_vln_tgfb,
+  width = 12,
+  height = 12,
+  dpi = 300
+)
+
+## -------------------------------------------------
+## 7. Summary table
+## -------------------------------------------------
+
+score_summary <- fib_3x3@meta.data %>%
+  group_by(condition, fib_state3, group_3x3) %>%
+  summarise(
+    n_cells = n(),
+    podosome_mean = mean(podosome_score, na.rm = TRUE),
+    podosome_sd   = sd(podosome_score, na.rm = TRUE),
+    contraction_mean = mean(contraction_score, na.rm = TRUE),
+    contraction_sd   = sd(contraction_score, na.rm = TRUE),
+    TGFb_mean = mean(TGFb_response_score, na.rm = TRUE),
+    TGFb_sd   = sd(TGFb_response_score, na.rm = TRUE),
+    .groups = "drop"
+  )
+
+write.csv(
+  score_summary,
+  out_file(7, "Module_score_summary_3x3", "csv"),
+  row.names = FALSE
+)
+
+## -------------------------------------------------
+## 8. Long-format table for easier plotting later
+## -------------------------------------------------
+
+score_long <- fib_3x3@meta.data %>%
+  dplyr::select(condition, fib_state3, group_3x3,
+                podosome_score, contraction_score, TGFb_response_score) %>%
+  tidyr::pivot_longer(
+    cols = c(podosome_score, contraction_score, TGFb_response_score),
+    names_to = "score_type",
+    values_to = "score"
+  )
+
+write.csv(
+  score_long,
+  out_file(7, "Module_score_long_3x3", "csv"),
+  row.names = FALSE
+)
+
+## -------------------------------------------------
+## 9. Export Excel
+## -------------------------------------------------
+
+xlsx_path <- out_file(7, "Module_scores_3x3", "xlsx")
+
+wb <- createWorkbook()
+addWorksheet(wb, "summary")
+writeData(wb, "summary", score_summary)
+
+addWorksheet(wb, "long")
+writeData(wb, "long", score_long)
+
+addWorksheet(wb, "genes_used")
+genes_used_df <- data.frame(
+  category = c(
+    rep("podosome_score", length(genes_podosome)),
+    rep("contraction_score", length(genes_contraction)),
+    rep("TGFb_response_score", length(genes_tgfb))
+  ),
+  gene = c(genes_podosome, genes_contraction, genes_tgfb)
+)
+writeData(wb, "genes_used", genes_used_df)
+
+saveWorkbook(wb, xlsx_path, overwrite = TRUE)
+
+cat("\n✅ Step7 completed — module scores saved\n")
+
+## =====================================================
+## Step 8 — Score relationship analysis
+##   1. Scatter plot (podosome vs contraction)
+##   2. UMAP trajectory gradient
+##   3. Correlation matrix
+## =====================================================
+
+suppressPackageStartupMessages({
+  library(Seurat)
+  library(dplyr)
+  library(ggplot2)
+  library(patchwork)
+  library(reshape2)
+  library(pheatmap)
+})
+
+DefaultAssay(fibro) <- "RNA"
+
+## -------------------------------------------------
+## 1. subset fibroblast 3x3
+## -------------------------------------------------
+
+fib_3x3 <- subset(
+  fibro,
+  subset = condition %in% c("sham","uuo2","uuo7") &
+    fib_state3 %in% c("Quiescent","Intermediate","Myofibroblast")
+)
+
+fib_3x3$group_3x3 <- paste(fib_3x3$condition, fib_3x3$fib_state3, sep = "_")
+
+## -------------------------------------------------
+## 2. Scatter plot
+## podosome_score vs contraction_score
+## -------------------------------------------------
+
+scatter_df <- fib_3x3@meta.data
+
+p_scatter <- ggplot(
+  scatter_df,
+  aes(
+    x = podosome_score,
+    y = contraction_score,
+    color = condition
+  )
+) +
+  geom_point(alpha = 0.4, size = 0.6) +
+  geom_smooth(method = "lm", se = FALSE, color = "black") +
+  theme_classic(base_size = 13) +
+  labs(
+    title = "Relationship between ECM remodeling and contraction programs",
+    x = "Podosome score",
+    y = "Contraction score"
+  )
+
+ggsave(
+  out_file(8, "Scatter_podosome_vs_contraction", "png"),
+  p_scatter,
+  width = 6,
+  height = 5,
+  dpi = 300
+)
+
+## -------------------------------------------------
+## 3. UMAP trajectory gradient
+## -------------------------------------------------
+
+p1 <- FeaturePlot(
+  fib_3x3,
+  features = "podosome_score",
+  reduction = "umap",
+  pt.size = 0.4
+) +
+  theme_classic() +
+  labs(title = "Podosome score")
+
+p2 <- FeaturePlot(
+  fib_3x3,
+  features = "TGFb_response_score",
+  reduction = "umap",
+  pt.size = 0.4
+) +
+  theme_classic() +
+  labs(title = "TGF-beta response")
+
+p3 <- FeaturePlot(
+  fib_3x3,
+  features = "contraction_score",
+  reduction = "umap",
+  pt.size = 0.4
+) +
+  theme_classic() +
+  labs(title = "Contraction score")
+
+ggsave(
+  out_file(8, "UMAP_activation_gradient", "png"),
+  p1 | p2 | p3,
+  width = 14,
+  height = 4.5,
+  dpi = 300
+)
+
+## -------------------------------------------------
+## 4. Correlation matrix
+## -------------------------------------------------
+
+## add some ECM genes
+genes_interest <- c(
+  "podosome_score",
+  "contraction_score",
+  "TGFb_response_score",
+  "Col1a1",
+  "Col1a2",
+  "Fn1",
+  "Lox",
+  "Itgb1",
+  "Ddr1"
+)
+
+expr_mat <- FetchData(
+  fib_3x3,
+  vars = genes_interest
+)
+
+cor_mat <- cor(expr_mat, method = "pearson")
+
+pheatmap(
+  cor_mat,
+  clustering_distance_rows = "euclidean",
+  clustering_distance_cols = "euclidean",
+  color = colorRampPalette(c("blue","white","red"))(100),
+  main = "Correlation between fibrosis-related programs",
+  filename = out_file(8, "Correlation_matrix_scores", "png"),
+  width = 6,
+  height = 6
+)
+
+## -------------------------------------------------
+## 5. save correlation matrix
+## -------------------------------------------------
+
+write.csv(
+  cor_mat,
+  out_file(8, "Correlation_matrix_scores", "csv")
+)
+
+cat("\n✅ Step8 completed — scatter, trajectory, and correlation plots saved\n")
+
+## =====================================================
+## Step 9 — Pseudotime trajectory (Slingshot, Seurat v5 compatible)
+##        root direction anchored by sham_Quiescent
+## =====================================================
+
+suppressPackageStartupMessages({
+  library(Seurat)
+  library(SingleCellExperiment)
+  library(slingshot)
+  library(ggplot2)
+  library(dplyr)
+  library(patchwork)
+  library(openxlsx)
+})
+
+DefaultAssay(fibro) <- "RNA"
+
+## -------------------------------------------------
+## 0. check required module scores
+## -------------------------------------------------
+
+required_cols <- c("podosome_score", "contraction_score", "TGFb_response_score")
+missing_cols <- setdiff(required_cols, colnames(fibro@meta.data))
+if (length(missing_cols) > 0) {
+  stop("Missing required module score columns: ", paste(missing_cols, collapse = ", "))
+}
+
+## -------------------------------------------------
+## 1. subset 3 conditions × 3 fibroblast states
+## -------------------------------------------------
+
+fib_3x3 <- subset(
+  fibro,
+  subset = condition %in% c("sham", "uuo2", "uuo7") &
+           fib_state3 %in% c("Quiescent", "Intermediate", "Myofibroblast")
+)
+
+fib_3x3$condition  <- factor(fib_3x3$condition, levels = c("sham", "uuo2", "uuo7"))
+fib_3x3$fib_state3 <- factor(fib_3x3$fib_state3, levels = c("Quiescent", "Intermediate", "Myofibroblast"))
+
+fib_3x3$group_3x3 <- paste(fib_3x3$condition, fib_3x3$fib_state3, sep = "_")
+fib_3x3$group_3x3 <- factor(
+  fib_3x3$group_3x3,
+  levels = c(
+    "sham_Quiescent",
+    "sham_Intermediate",
+    "sham_Myofibroblast",
+    "uuo2_Quiescent",
+    "uuo2_Intermediate",
+    "uuo2_Myofibroblast",
+    "uuo7_Quiescent",
+    "uuo7_Intermediate",
+    "uuo7_Myofibroblast"
+  )
+)
+
+cat("Cells in fib_3x3:", ncol(fib_3x3), "\n")
+print(table(fib_3x3$group_3x3))
+
+## -------------------------------------------------
+## 2. Seurat v5 fix: join RNA layers before conversion
+## -------------------------------------------------
+
+if (exists("Layers", mode = "function") &&
+    exists("JoinLayers", mode = "function")) {
+
+  lay <- tryCatch(Layers(fib_3x3[["RNA"]]), error = function(e) NULL)
+
+  if (!is.null(lay) && length(lay) > 1) {
+    cat("Joining RNA layers before as.SingleCellExperiment() ...\n")
+    fib_3x3 <- JoinLayers(fib_3x3, assay = "RNA")
+  }
+}
+
+## optional slimming to avoid conversion issues
+fib_3x3_sce <- DietSeurat(
+  fib_3x3,
+  assays = "RNA",
+  dimreducs = "umap",
+  graphs = NULL
+)
+
+## -------------------------------------------------
+## 3. Seurat -> SingleCellExperiment
+## -------------------------------------------------
+
+sce <- as.SingleCellExperiment(fib_3x3_sce, assay = "RNA")
+
+## transfer UMAP
+reducedDims(sce)$UMAP <- Embeddings(fib_3x3, "umap")
+
+## add metadata
+colData(sce)$cluster    <- fib_3x3$fib_state3
+colData(sce)$condition  <- fib_3x3$condition
+colData(sce)$group_3x3  <- fib_3x3$group_3x3
+
+## -------------------------------------------------
+## 4. run slingshot
+## -------------------------------------------------
+
+sce <- slingshot(
+  sce,
+  clusterLabels = "cluster",
+  reducedDim = "UMAP",
+  start.clus = "Quiescent"
+)
+
+## -------------------------------------------------
+## 5. extract pseudotime
+## -------------------------------------------------
+
+pt <- slingPseudotime(sce)
+
+if (is.null(dim(pt))) {
+  pseudotime_vec <- as.numeric(pt)
+} else {
+  pseudotime_vec <- as.numeric(pt[, 1])
+}
+
+fib_3x3$pseudotime <- pseudotime_vec
+
+## -------------------------------------------------
+## 6. orient pseudotime using sham_Quiescent as early root
+## -------------------------------------------------
+
+mean_root <- mean(
+  fib_3x3$pseudotime[
+    fib_3x3$condition == "sham" &
+    fib_3x3$fib_state3 == "Quiescent"
+  ],
+  na.rm = TRUE
+)
+
+mean_terminal <- mean(
+  fib_3x3$pseudotime[
+    fib_3x3$condition == "uuo7" &
+    fib_3x3$fib_state3 == "Myofibroblast"
+  ],
+  na.rm = TRUE
+)
+
+if (!is.na(mean_root) && !is.na(mean_terminal) && mean_root > mean_terminal) {
+  max_pt <- max(fib_3x3$pseudotime, na.rm = TRUE)
+  fib_3x3$pseudotime <- max_pt - fib_3x3$pseudotime
+}
+
+colData(sce)$pseudotime <- fib_3x3$pseudotime
+
+## -------------------------------------------------
+## 7. save updated object
+## -------------------------------------------------
+
+saveRDS(fib_3x3, out_rds(9, "fibroblast_3x3_with_pseudotime"))
+
+## -------------------------------------------------
+## 8. make plotting dataframe
+## -------------------------------------------------
+
+umap_mat <- Embeddings(fib_3x3, "umap")
+
+df_plot <- data.frame(
+  cell = colnames(fib_3x3),
+  UMAP_1 = umap_mat[, 1],
+  UMAP_2 = umap_mat[, 2],
+  condition = fib_3x3$condition,
+  fib_state3 = fib_3x3$fib_state3,
+  group_3x3 = fib_3x3$group_3x3,
+  pseudotime = fib_3x3$pseudotime,
+  podosome_score = fib_3x3$podosome_score,
+  contraction_score = fib_3x3$contraction_score,
+  TGFb_response_score = fib_3x3$TGFb_response_score
+)
+
+write.csv(
+  df_plot,
+  out_file(9, "Pseudotime_plotting_table", "csv"),
+  row.names = FALSE
+)
+
+## -------------------------------------------------
+## 9. UMAP — pseudotime
+## -------------------------------------------------
+
+p_pt <- ggplot(df_plot, aes(x = UMAP_1, y = UMAP_2, color = pseudotime)) +
+  geom_point(size = 0.7, alpha = 0.9) +
+  scale_color_viridis_c(option = "plasma") +
+  theme_classic(base_size = 12) +
+  labs(
+    title = "Fibroblast pseudotime trajectory",
+    subtitle = "Slingshot trajectory oriented from sham_Quiescent",
+    x = "UMAP_1",
+    y = "UMAP_2",
+    color = "Pseudotime"
+  )
+
+ggsave(
+  out_file(9, "Pseudotime_trajectory_UMAP", "png"),
+  p_pt,
+  width = 6,
+  height = 5,
+  dpi = 300
+)
+
+## -------------------------------------------------
+## 10. UMAP — condition and state
+## -------------------------------------------------
+
+p_cond <- ggplot(df_plot, aes(x = UMAP_1, y = UMAP_2, color = condition)) +
+  geom_point(size = 0.7, alpha = 0.9) +
+  theme_classic(base_size = 12) +
+  labs(title = "Fibroblasts by condition", x = "UMAP_1", y = "UMAP_2")
+
+p_state <- ggplot(df_plot, aes(x = UMAP_1, y = UMAP_2, color = fib_state3)) +
+  geom_point(size = 0.7, alpha = 0.9) +
+  theme_classic(base_size = 12) +
+  labs(title = "Fibroblasts by state", x = "UMAP_1", y = "UMAP_2")
+
+ggsave(
+  out_file(9, "Pseudotime_UMAP_condition_state", "png"),
+  p_cond | p_state,
+  width = 10,
+  height = 4.5,
+  dpi = 300
+)
+
+## -------------------------------------------------
+## 11. module scores along pseudotime
+## -------------------------------------------------
+
+p1 <- ggplot(df_plot, aes(x = pseudotime, y = podosome_score)) +
+  geom_point(alpha = 0.35, size = 0.6) +
+  geom_smooth(method = "loess", se = TRUE, color = "black") +
+  theme_classic(base_size = 12) +
+  labs(
+    title = "Podosome score along pseudotime",
+    x = "Pseudotime",
+    y = "Podosome score"
+  )
+
+p2 <- ggplot(df_plot, aes(x = pseudotime, y = TGFb_response_score)) +
+  geom_point(alpha = 0.35, size = 0.6) +
+  geom_smooth(method = "loess", se = TRUE, color = "black") +
+  theme_classic(base_size = 12) +
+  labs(
+    title = "TGF-beta response along pseudotime",
+    x = "Pseudotime",
+    y = "TGF-beta response score"
+  )
+
+p3 <- ggplot(df_plot, aes(x = pseudotime, y = contraction_score)) +
+  geom_point(alpha = 0.35, size = 0.6) +
+  geom_smooth(method = "loess", se = TRUE, color = "black") +
+  theme_classic(base_size = 12) +
+  labs(
+    title = "Contraction score along pseudotime",
+    x = "Pseudotime",
+    y = "Contraction score"
+  )
+
+ggsave(
+  out_file(9, "Module_scores_vs_pseudotime", "png"),
+  p1 | p2 | p3,
+  width = 14,
+  height = 4.6,
+  dpi = 300
+)
+
+## -------------------------------------------------
+## 12. pseudotime summary by group
+## -------------------------------------------------
+
+pt_summary <- df_plot %>%
+  group_by(condition, fib_state3, group_3x3) %>%
+  summarise(
+    n_cells = n(),
+    pseudotime_mean = mean(pseudotime, na.rm = TRUE),
+    pseudotime_sd = sd(pseudotime, na.rm = TRUE),
+    podosome_mean = mean(podosome_score, na.rm = TRUE),
+    TGFb_mean = mean(TGFb_response_score, na.rm = TRUE),
+    contraction_mean = mean(contraction_score, na.rm = TRUE),
+    .groups = "drop"
+  )
+
+write.csv(
+  pt_summary,
+  out_file(9, "Pseudotime_summary_by_group", "csv"),
+  row.names = FALSE
+)
+
+## -------------------------------------------------
+## 13. optional boxplot of pseudotime by group
+## -------------------------------------------------
+
+p_box <- ggplot(df_plot, aes(x = group_3x3, y = pseudotime, fill = condition)) +
+  geom_boxplot(outlier.size = 0.4) +
+  theme_classic(base_size = 12) +
+  labs(
+    title = "Pseudotime distribution across fibroblast groups",
+    x = NULL,
+    y = "Pseudotime"
+  ) +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+
+ggsave(
+  out_file(9, "Pseudotime_boxplot_by_group", "png"),
+  p_box,
+  width = 10,
+  height = 5,
+  dpi = 300
+)
+
+## -------------------------------------------------
+## 14. export Excel
+## -------------------------------------------------
+
+xlsx_path <- out_file(9, "Pseudotime_results", "xlsx")
+
+wb <- createWorkbook()
+
+addWorksheet(wb, "plotting_table")
+writeData(wb, "plotting_table", df_plot)
+
+addWorksheet(wb, "summary_by_group")
+writeData(wb, "summary_by_group", pt_summary)
+
+saveWorkbook(wb, xlsx_path, overwrite = TRUE)
+
+cat("\n✅ Step9 completed — Slingshot pseudotime analysis saved\n")
