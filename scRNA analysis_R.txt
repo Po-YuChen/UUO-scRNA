@@ -606,6 +606,63 @@ saveRDS(fibro, out_rds(4, "fibroblast_state3"))
 cat("\n✅ Step4 saved:", out_rds(4, "fibroblast_state3"), "\n")
 
 ## =====================================================
+## Step 4C — DDR2 / pericyte / desmin / vimentin dot plot
+## Current 3-state classification is unchanged
+## =====================================================
+
+DefaultAssay(fibro) <- "RNA"
+
+genes_in <- rownames(fibro[["RNA"]])
+gene_map <- setNames(genes_in, toupper(genes_in))
+
+match_genes_ci <- function(g) {
+  g2 <- gene_map[toupper(g)]
+  g2 <- unname(g2[!is.na(g2)])
+  unique(g2)
+}
+
+marker_raw <- c(
+  ## DDR receptors
+  "Ddr1", "Ddr2",
+
+  ## pericyte / mural markers
+  "Pdgfrb", "Cspg4", "Abcc9", "Kcnj8", "Rgs5", "Higd1b",
+
+  ## mesenchymal / cytoskeletal markers
+  "Des", "Vim"
+)
+
+marker_genes <- match_genes_ci(marker_raw)
+
+cat("Detected DDR2/pericyte/desmin/vimentin markers:\n")
+print(marker_genes)
+
+p_dot_ddr2_pericyte <- DotPlot(
+  fibro,
+  features = marker_genes,
+  group.by = "fib_state3"
+) +
+  RotatedAxis() +
+  theme_classic(base_size = 12) +
+  labs(
+    title = "DDR2, pericyte, desmin, and vimentin marker expression",
+    x = "Marker genes",
+    y = "Fibroblast state",
+    color = "Average expression",
+    size = "% expressing cells"
+  )
+
+ggsave(
+  out_file(4, "State3_DDR2_Pericyte_Desmin_Vimentin_DotPlot", "png"),
+  p_dot_ddr2_pericyte,
+  width = 9.5,
+  height = 4.8,
+  dpi = 300
+)
+
+p_dot_ddr2_pericyte
+
+## =====================================================
 ## Step 5 — Composition + DDR1 + Bar stats (FINAL CLEAN)
 ## =====================================================
 
